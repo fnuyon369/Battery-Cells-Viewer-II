@@ -12,8 +12,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install matplotlib numpy pyinstaller
-      - run: pyinstaller --noconsole --onefile --name BatteryCellViewer --icon icon.ico --add-data "icon.ico;." app.py
+      - run: pyinstaller --noconsole --onefile --name BatteryCellsAnalyzerIII --icon icon.ico --add-data "icon.ico;." app.py
       - uses: actions/upload-artifact@v4
         with:
-          name: BatteryCellViewer-windows
-          path: dist/BatteryCellViewer.exe
+          name: BatteryCellsAnalyzerIII-windows
+          path: dist/BatteryCellsAnalyzerIII.exe

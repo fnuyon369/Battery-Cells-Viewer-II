@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Battery Cell Viewer - UVP / OVP 23 Cells
+Battery Cells Analyzer III - Developed By Triono
 Membaca file ageing battery pack (.CDS), memfilter kondisi UVP (SOC 0%) dan
 OVP (SOC 100%), lalu menampilkan diagram batang tegangan 23 cell.
 Target: Windows, portable (dibuild menjadi satu file .exe dengan PyInstaller).
@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from statistics import mean, median
 
 N_CELLS = 23
-APP_TITLE = "Battery Ageing - UVP / OVP Cell Viewer (23 Cells)"
+APP_TITLE = "Battery Cells Analyzer III - Developed By Triono"
 # Tema futuristik (gelap + neon)
 BG, PANEL, PANEL2, BORDER = "#0a0f1e", "#111a30", "#17223d", "#26365e"
 FG, MUTED, ACC = "#d8e6ff", "#7f92b8", "#00e5ff"
@@ -103,23 +103,36 @@ def parse_cds(path):
     dc = delim != ","
     sp = [split_line(l, delim) for _, l in lines]
 
-    start = None
-    for i in range(len(sp) - 1):
-        a, b = sp[i], sp[i + 1]
-        if len(a) >= 3 and len(a) == len(b) and numfrac(a, dc) >= 0.6 and numfrac(b, dc) >= 0.6:
-            start = i
-            break
+    start, headers = None, None
+    # 1) Cari header pertama yang memuat kolom cell 1..23 secara lengkap, lalu mulai
+    #    membaca dari baris data tepat setelahnya (bagian awal file tanpa VCELL dilewati).
+    for j in range(len(sp) - 1):
+        f = sp[j]
+        if len(f) >= N_CELLS and numfrac(f, dc) < 0.5 and auto_detect(f)[1]:
+            for i in range(j + 1, len(sp) - 1):
+                a, b = sp[i], sp[i + 1]
+                if len(a) == len(f) and len(b) == len(f) and numfrac(a, dc) >= 0.6 and numfrac(b, dc) >= 0.6:
+                    start, headers = i, f
+                    break
+            if start is not None:
+                break
+    # 2) Cadangan: blok data numerik pertama (pemetaan kolom manual bila perlu)
     if start is None:
-        raise ValueError("Baris data numerik tidak ditemukan di dalam file.")
-
-    ncols = len(sp[start])
-    headers = None
-    for j in range(start - 1, -1, -1):
-        if len(sp[j]) == ncols and numfrac(sp[j], dc) < 0.5:
-            headers = sp[j]
-            break
-    if headers is None:
-        headers = ["Kolom %d" % (i + 1) for i in range(ncols)]
+        for i in range(len(sp) - 1):
+            a, b = sp[i], sp[i + 1]
+            if len(a) >= 3 and len(a) == len(b) and numfrac(a, dc) >= 0.6 and numfrac(b, dc) >= 0.6:
+                start = i
+                break
+        if start is None:
+            raise ValueError("Baris data numerik tidak ditemukan di dalam file.")
+        ncols = len(sp[start])
+        for j in range(start - 1, -1, -1):
+            if len(sp[j]) == ncols and numfrac(sp[j], dc) < 0.5:
+                headers = sp[j]
+                break
+        if headers is None:
+            headers = ["Kolom %d" % (i + 1) for i in range(ncols)]
+    ncols = len(headers)
 
     rows, linenos = [], []
     for i in range(start, len(sp)):
@@ -127,7 +140,7 @@ def parse_cds(path):
             rows.append(sp[i])
             linenos.append(lines[i][0])
     return {"headers": headers, "rows": rows, "linenos": linenos,
-            "delim": delim, "dc": dc}
+            "delim": delim, "dc": dc, "start_line": lines[start][0]}
 
 
 CELL_PATTERNS = [
@@ -202,10 +215,38 @@ def _filetime_str(ft):
         return "-"
 
 
+def _load_layout(con, table):
+    """Baca tata letak kolom satu tabel RecordSampDec_* -> dict atau None bila VCELL tidak lengkap."""
+    fields, block = {}, None
+    for off, bsz, name, lang, dt, dl, prec in con.execute(
+            'select offAddrInBlockData,blockSize,showName,languageResoureStr,'
+            'dataType,dataLen,decimalPrecision from "%s"' % table):
+        block = bsz
+        fields[name] = (off, dt, dl, prec or 0)
+        if lang:
+            fields[lang] = (off, dt, dl, prec or 0)
+    vc = [fields.get("VCELL_%d" % i) for i in range(1, N_CELLS + 1)]
+    found = sum(v is not None for v in vc)
+    lay = {"block": block, "found": found, "ok": found == N_CELLS}
+    if lay["ok"]:
+        offs = [v[0] for v in vc]
+        lay.update({
+            "offs": offs, "prec": vc[0][3],
+            "contig": offs == [offs[0] + 4 * i for i in range(N_CELLS)],
+            "soc": fields["SOC"][0] if "SOC" in fields else None,
+            "cur": fields["STRING_CURRENT"][0] if "STRING_CURRENT" in fields else None,
+            "vol": fields["STRING_VOLT"][0] if "STRING_VOLT" in fields else None,
+            "time": fields["STRING_SYSTEM_TIME"][0] if "STRING_SYSTEM_TIME" in fields else None,
+            "cyc": fields["CYCLE"][0] if "CYCLE" in fields else None,
+        })
+    return lay
+
+
 def read_cds_sqlite(path):
     """Baca .CDS native (database SQLite dari tester baterai).
-    Tata letak kolom dibaca dari tabel RecordSampDec_*; data dari RecordData_<step>.
-    Setiap record = blockSize byte (344), nilai float32 little-endian."""
+    Tiap step punya tata letak kolom sendiri (RecordStep.RecordSamp -> RecordSampDec_<hash>).
+    Step yang tidak punya VCELL_1..23 lengkap dilewati, sehingga pembacaan otomatis
+    dimulai dari step pertama yang kolom VCELL-nya lengkap."""
     tmp = None
     try:
         uri = __import__("pathlib").Path(path).resolve().as_uri() + "?mode=ro"
@@ -220,37 +261,42 @@ def read_cds_sqlite(path):
         dec = [t for t in tables if t.startswith("RecordSampDec_")]
         if not dec:
             raise ValueError("Struktur kolom data (RecordSampDec_*) tidak ditemukan di file .CDS ini.")
-        fields, block = {}, None
-        for off, bsz, name, lang, dt, dl, prec in con.execute(
-                'select offAddrInBlockData,blockSize,showName,languageResoureStr,'
-                'dataType,dataLen,decimalPrecision from "%s"' % dec[0]):
-            block = bsz
-            fields[name] = (off, dt, dl, prec or 0)
-            if lang:
-                fields[lang] = (off, dt, dl, prec or 0)
-        vc = [fields.get("VCELL_%d" % i) for i in range(1, N_CELLS + 1)]
-        if any(v is None for v in vc):
-            raise ValueError("Kolom VCELL_1..VCELL_%d tidak lengkap di file ini (ditemukan %d)."
-                             % (N_CELLS, sum(v is not None for v in vc)))
-        offs = [v[0] for v in vc]
-        prec = vc[0][3]
-        contiguous = offs == [offs[0] + 4 * i for i in range(N_CELLS)]
-        o_soc = fields["SOC"][0] if "SOC" in fields else None
-        o_cur = fields["STRING_CURRENT"][0] if "STRING_CURRENT" in fields else None
-        o_vol = fields["STRING_VOLT"][0] if "STRING_VOLT" in fields else None
-        o_time = fields["STRING_SYSTEM_TIME"][0] if "STRING_SYSTEM_TIME" in fields else None
-        o_cyc = fields["CYCLE"][0] if "CYCLE" in fields else None
+
+        # step -> tabel tata letak
+        step_table = {}
+        try:
+            for sid, rs in con.execute("select StepID, RecordSamp from RecordStep"):
+                step_table[sid] = "RecordSampDec_%08X" % (int(rs) & 0xFFFFFFFF)
+        except (sqlite3.Error, TypeError, ValueError):
+            pass
+        layouts = {}
+
+        def layout_for(step):
+            t = step_table.get(step)
+            if t not in tables:
+                t = dec[0]
+            if t not in layouts:
+                layouts[t] = _load_layout(con, t)
+            return layouts[t]
 
         recs = sorted((int(m.group(1)), t) for t in tables
                       for m in [re.fullmatch(r"RecordData_(\d+)", t)] if m)
         if not recs:
             raise ValueError("Tabel RecordData_* tidak ditemukan.")
+
         cells, soc, times, steps, cur, vol, cyc_raw = [], [], [], [], [], [], []
+        skipped, has_cyc = [], False
         for step, t in recs:
+            lay = layout_for(step)
+            if not lay["ok"]:
+                skipped.append(step)
+                continue
+            block, offs, prec = lay["block"], lay["offs"], lay["prec"]
+            has_cyc = has_cyc or lay["cyc"] is not None
             for blob, cnt in con.execute('select RecordDataBlock,Count from "%s" order by DataID' % t):
                 for k in range(len(blob) // block):
                     b = k * block
-                    if contiguous:
+                    if lay["contig"]:
                         vals = list(struct.unpack_from("<%df" % N_CELLS, blob, b + offs[0]))
                     else:
                         vals = [struct.unpack_from("<f", blob, b + o)[0] for o in offs]
@@ -258,32 +304,38 @@ def read_cds_sqlite(path):
                         cells.append(None)
                     else:
                         cells.append([round(v, prec) for v in vals])
-                    soc.append(struct.unpack_from("<f", blob, b + o_soc)[0] if o_soc is not None else float("nan"))
-                    cur.append(struct.unpack_from("<f", blob, b + o_cur)[0] if o_cur is not None else float("nan"))
-                    vol.append(struct.unpack_from("<f", blob, b + o_vol)[0] if o_vol is not None else float("nan"))
-                    times.append(_filetime_str(struct.unpack_from("<Q", blob, b + o_time)[0])
-                                 if o_time is not None else "-")
+                    f = lambda o: struct.unpack_from("<f", blob, b + o)[0] if o is not None else float("nan")
+                    soc.append(f(lay["soc"]))
+                    cur.append(f(lay["cur"]))
+                    vol.append(f(lay["vol"]))
+                    times.append(_filetime_str(struct.unpack_from("<Q", blob, b + lay["time"])[0])
+                                 if lay["time"] is not None else "-")
                     steps.append(step)
-                    cyc_raw.append(struct.unpack_from("<f", blob, b + o_cyc)[0] if o_cyc is not None else 0.0)
+                    cyc_raw.append(f(lay["cyc"]) if lay["cyc"] is not None else 0.0)
         if not cells:
-            raise ValueError("Tidak ada record data di dalam file.")
+            best = max((l["found"] for l in layouts.values()), default=0)
+            raise ValueError(
+                "Tidak ada step dengan kolom VCELL_1..VCELL_%d lengkap di file ini "
+                "(kolom VCELL terbanyak yang ditemukan: %d)." % (N_CELLS, best))
+
         cycle = None
-        if o_cyc is not None:
+        if has_cyc:
             vals = [0.0 if (math.isnan(v) or math.isinf(v)) else v for v in cyc_raw]
-            if any(abs(v - round(v)) > 1e-3 for v in vals):   # tersimpan skala 0.001 (0.019 = cycle 19)
+            if any(abs(v - round(v)) > 1e-3 for v in vals):   # skala 0.001 (0.019 = cycle 19)
                 vals = [v * 1000.0 for v in vals]
             cycle = [int(round(v)) for v in vals]
+        has_soc = any(l["ok"] and l["soc"] is not None for l in layouts.values())
         info = {}
         try:
             r = con.execute("select ComputerName,TemplateName from ChannelStartInfo").fetchone()
             info = {"pc": r[0], "template": r[1]}
         except Exception:
             pass
-        return {"cells": cells,
-                "soc": soc if o_soc is not None else None,
+        return {"cells": cells, "soc": soc if has_soc else None,
                 "times": times, "linenos": list(range(1, len(cells) + 1)),
                 "steps": steps, "current": cur, "vpack": vol, "cycle": cycle,
-                "unit_mv": False, "source": "sqlite", "info": info}
+                "unit_mv": False, "source": "sqlite", "info": info,
+                "skipped_steps": skipped, "first_step": steps[0]}
     finally:
         con.close()
         if tmp:
@@ -680,6 +732,10 @@ def run_gui():
             note = ""
             if self.mode_var.get() == "soc" and used == "volt":
                 note = "  [SOC tidak ada di file -> memakai filter tegangan]"
+            skip = self.ds.get("skipped_steps")
+            if skip:
+                note += "  [step %s dilewati (tanpa VCELL) -> mulai dari step %s]" % (
+                    ",".join(str(x) for x in skip), self.ds.get("first_step"))
             self.status.config(text="UVP: %d cycle | OVP: %d cycle | mode: %s | kolom Cycle: %s | "
                                     "sumber: %s%s" % (
                 len(uvp), len(ovp), "SOC" if used == "soc" else "Tegangan",
